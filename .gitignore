@@ -1,1 +1,13 @@
+# Ignore common files
+.DS_Store
+*.log
+*.swo
+*.swp
+
+# Ignore environment files
+.env
+.env.*
+
+# Ignore package manager folders
+node_modules/
 
