@@ -1,1 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Drowsiness Detection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #111827; /* Dark background */
+        }
+        .container {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            margin: auto;
+        }
+        #webcam {
+            width: 100%;
+            height: auto;
+            border-radius: 0.75rem;
+            transform: scaleX(-1); /* Mirror effect */
+        }
+        #overlayCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); /* Mirror effect */
+        }
+        .status-bar {
+            transition: all 0.3s ease-in-out;
+        }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+</head>
+<body class="flex items-center justify-center min-h-screen text-white p-4">
+
+    <div class="w-full max-w-2xl mx-auto">
+        <h1 class="text-3xl font-bold text-center mb-4">Drowsiness Detection System</h1>
+        <p id="loading-message" class="text-center text-lg text-gray-400">Please wait, loading models...</p>
+
+        <div id="app-container" class="hidden">
+            <div class="container bg-gray-900 rounded-xl shadow-lg overflow-hidden">
+                <video id="webcam" autoplay playsinline></video>
+                <canvas id="overlayCanvas"></canvas>
+            </div>
+
+            <div id="status-bar" class="status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-gray-800">
+                <span id="status-text">Awaiting Camera Permission...</span>
+            </div>
+            
+            <div class="mt-4 p-4 rounded-lg bg-gray-800 text-gray-300 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <h3 class="font-semibold text-lg">Eye Aspect Ratio (EAR)</h3>
+                    <p id="ear-value">Value: N/A (T: N/A)</p>
+                </div>
+                <div>
+                    <h3 class="font-semibold text-lg">Head Pitch</h3>
+                    <p id="pitch-value">Value: N/A (T: N/A)</p>
+                </div>
+                <div class="col-span-1 md:col-span-2">
+                    <h3 class="font-semibold text-lg">Fatigue Score</h3>
+                    <div class="w-full bg-gray-700 rounded-full h-4 mt-1">
+                        <div id="fatigue-bar" class="bg-blue-500 h-4 rounded-full transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+<script type="module">
+    const videoElement = document.getElementById('webcam');
+    const canvasElement = document.getElementById('overlayCanvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const statusText = document.getElementById('status-text');
+    const statusBar = document.getElementById('status-bar');
+    const earValueText = document.getElementById('ear-value');
+    const pitchValueText = document.getElementById('pitch-value');
+    const fatigueBar = document.getElementById('fatigue-bar');
+    const loadingMessage = document.getElementById('loading-message');
+    const appContainer = document.getElementById('app-container');
+
+    // --- CONFIGURATION ---
+    const CALIBRATION_SECONDS = 5;
+    const EAR_THRESHOLD_FACTOR = 0.80;
+    const PITCH_THRESHOLD_OFFSET = -12;
+    const FATIGUE_SCORE_THRESHOLD = 25;
+    const HISTORY_LENGTH = 10;
+    const ALERT_DELAY_SECONDS = 2.5;
+
+    // --- STATE VARIABLES ---
+    let isCalibrating = true;
+    let calibrationStartTime = null;
+    let earHistory = [];
+    let pitchHistory = [];
+    let dynamicEarThreshold = 0;
+    let dynamicPitchThreshold = 0;
+    let fatigueScore = 0;
+    let audioContext;
+    let lastAlertTime = 0;
+    let drowsyStartTime = null;
+    let utterance = new SpeechSynthesisUtterance("Drowsiness detected. Please be careful.");
+    utterance.volume = 1; // Max volume
+    utterance.rate = 1; // Normal speed
+
+    function playAlert() {
+        const now = Date.now();
+        if (now - lastAlertTime < 5000) return; // Play alert at most once every 5 seconds
+        lastAlertTime = now;
+
+        if ('speechSynthesis' in window) {
+            window.speechSynthesis.speak(utterance);
+        } else {
+            // Fallback for older browsers: high-volume beep
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            const audioNow = audioContext.currentTime;
+            const oscillator = audioContext.createOscillator();
+            const gain = audioContext.createGain();
+            oscillator.connect(gain);
+            gain.connect(audioContext.destination);
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(900, audioNow);
+            gain.gain.setValueAtTime(1.0, audioNow); // Max volume for beep
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioNow + 0.5);
+            oscillator.start(audioNow);
+            oscillator.stop(audioNow + 0.5);
+        }
+    }
+
+    function euclideanDist(point1, point2) {
+        return Math.sqrt((point1.x - point2.x) ** 2 + (point1.y - point2.y) ** 2 + (point1.z - point2.z) ** 2);
+    }
+
+    function calculateEAR(landmarks) {
+        const p1 = landmarks[160]; const p2 = landmarks[144];
+        const p3 = landmarks[159]; const p4 = landmarks[145];
+        const p5 = landmarks[158]; const p6 = landmarks[153];
+        const p7 = landmarks[33];  const p8 = landmarks[133];
+        const earLeft = (euclideanDist(p1, p2) + euclideanDist(p3, p4) + euclideanDist(p5, p6)) / (2 * euclideanDist(p7, p8));
+        
+        const p9 = landmarks[387]; const p10 = landmarks[373];
+        const p11 = landmarks[386]; const p12 = landmarks[374];
+        const p13 = landmarks[385]; const p14 = landmarks[380];
+        const p15 = landmarks[263]; const p16 = landmarks[362];
+        const earRight = (euclideanDist(p9, p10) + euclideanDist(p11, p12) + euclideanDist(p13, p14)) / (2 * euclideanDist(p15, p16));
+        
+        return (earLeft + earRight) / 2;
+    }
+
+    function calculatePitch(landmarks) {
+        const nose = landmarks[1];
+        const midEye = { x: (landmarks[33].x + landmarks[263].x) / 2, y: (landmarks[33].y + landmarks[263].y) / 2 };
+        const pitch = (midEye.y - nose.y) * 1000;
+        return pitch;
+    }
+
+    function onResults(results) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+            const landmarks = results.multiFaceLandmarks[0];
+            const ear = calculateEAR(landmarks);
+            const pitch = calculatePitch(landmarks);
+
+            if (isCalibrating) {
+                if (!calibrationStartTime) calibrationStartTime = Date.now();
+                const elapsed = (Date.now() - calibrationStartTime) / 1000;
+
+                if (elapsed < CALIBRATION_SECONDS) {
+                    statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-blue-600';
+                    statusText.textContent = `Calibrating... Please look straight. ${Math.ceil(CALIBRATION_SECONDS - elapsed)}s`;
+                    earHistory.push(ear);
+                    pitchHistory.push(pitch);
+                } else {
+                    dynamicEarThreshold = (earHistory.reduce((a, b) => a + b, 0) / earHistory.length) * EAR_THRESHOLD_FACTOR;
+                    dynamicPitchThreshold = (pitchHistory.reduce((a, b) => a + b, 0) / pitchHistory.length) + PITCH_THRESHOLD_OFFSET;
+                    isCalibrating = false;
+                    earHistory = []; pitchHistory = [];
+                }
+            } else {
+                earHistory.push(ear);
+                pitchHistory.push(pitch);
+                if (earHistory.length > HISTORY_LENGTH) earHistory.shift();
+                if (pitchHistory.length > HISTORY_LENGTH) pitchHistory.shift();
+
+                const smoothedEar = earHistory.reduce((a, b) => a + b, 0) / earHistory.length;
+                const smoothedPitch = pitchHistory.reduce((a, b) => a + b, 0) / pitchHistory.length;
+                
+                let isDrowsyEvent = false;
+                if (smoothedEar < dynamicEarThreshold) {
+                    fatigueScore = Math.min(FATIGUE_SCORE_THRESHOLD * 1.5, fatigueScore + 1.5);
+                    isDrowsyEvent = true;
+                }
+                if (smoothedPitch < dynamicPitchThreshold) {
+                    fatigueScore = Math.min(FATIGUE_SCORE_THRESHOLD * 1.5, fatigueScore + 2.0);
+                    isDrowsyEvent = true;
+                }
+
+                if (!isDrowsyEvent) {
+                    fatigueScore = Math.max(0, fatigueScore - 1);
+                }
+
+                if (fatigueScore > FATIGUE_SCORE_THRESHOLD) {
+                    if (drowsyStartTime === null) {
+                        drowsyStartTime = Date.now();
+                    }
+                    const elapsedDrowsyTime = (Date.now() - drowsyStartTime) / 1000;
+
+                    if (elapsedDrowsyTime > ALERT_DELAY_SECONDS) {
+                        statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-red-600 animate-pulse';
+                        statusText.textContent = 'ALERT! Pull Over!';
+                        playAlert();
+                    } else {
+                        statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-orange-500';
+                        statusText.textContent = 'Drowsiness Detected!';
+                    }
+                } else {
+                    drowsyStartTime = null;
+                    if (fatigueScore > FATIGUE_SCORE_THRESHOLD / 2) {
+                        statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-yellow-500';
+                        statusText.textContent = 'Status: Mildly Drowsy';
+                    } else {
+                        statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-green-600';
+                        statusText.textContent = 'Status: Awake';
+                    }
+                }
+
+                earValueText.textContent = `Value: ${smoothedEar.toFixed(2)} (T: ${dynamicEarThreshold.toFixed(2)})`;
+                pitchValueText.textContent = `Value: ${smoothedPitch.toFixed(2)} (T: ${dynamicPitchThreshold.toFixed(2)})`;
+                fatigueBar.style.width = `${(fatigueScore / FATIGUE_SCORE_THRESHOLD) * 100}%`;
+            }
+        } else {
+            statusText.textContent = 'No face detected';
+            statusBar.className = 'status-bar mt-4 p-4 rounded-lg text-center text-2xl font-semibold bg-gray-800';
+        }
+        canvasCtx.restore();
+    }
+
+    const faceMesh = new FaceMesh({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+    }});
+
+    faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    faceMesh.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            await faceMesh.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    
+    camera.start().then(() => {
+        loadingMessage.classList.add('hidden');
+        appContainer.classList.remove('hidden');
+        statusText.textContent = 'Starting Calibration...';
+    }).catch(err => {
+        loadingMessage.textContent = "Error: Could not access webcam. Please check permissions and refresh.";
+        console.error("Webcam access error:", err);
+    });
+
+</script>
+</body>
+</html>
 
